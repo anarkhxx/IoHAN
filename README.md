@@ -5,11 +5,18 @@ The paper can be visited at https://ieeexplore.ieee.org/abstract/document/931801
 
 # Requirement
 
-       1.python=3.6
-       2.tensorflow-gpu=1.8.0
-       3.keras=2.2.0
+1.Keras==2.1.2
+2.matplotlib==3.3.2
+3.numpy==1.19.2
+4.pandas==1.1.3
+5.Pillow==8.0.1
+6.PyYAML==5.3.1
+7.scikit-learn==0.22
+8.scipy==1.5.3
+9.sklearn==0.0
+10.tensorboard==1.8.0
+11.tensorflow==1.8.0
 
-# Data Preparation
    
 (1)src/distance_cells/out1.txt  This file contains all the cell-id trajectories.
 
