@@ -1,0 +1,276 @@
+"""@author: Zeyu Li <zyli@cs.ucla.edu> or <zeyuli@g.ucla.edu>
+"""
+
+import tensorflow as tf
+
+from const import Constant
+from modules import multihead_attention, feedforward, embedding
+from module2 import agg_attention
+
+
+# ===== InterpRecSys Base Model =====
+class InterprecsysBase:
+
+    def __init__(self
+                 , embedding_dim
+                 , field_size
+                 , feature_size
+                 , learning_rate
+                 , batch_size
+                 , num_block
+                 , num_head
+                 , attention_size
+                 , pool_filter_size
+                 , dropout_rate
+                 , regularization_weight
+                 , random_seed=Constant.RANDOM_SEED
+                 , scale_embedding=False
+                 ):
+        # config parameters
+        self.embedding_dim = embedding_dim  # the C
+        self.scale_embedding = scale_embedding  # bool
+        self.field_size = field_size
+        self.feat_size = feature_size  # the T
+
+        self.dropout_rate = dropout_rate
+        self.random_seed = random_seed
+        self.num_block = num_block  # num of blocks of multi-head attn
+        self.num_head = num_head  # num of heads
+        self.attention_size = attention_size
+        self.regularization_weight = regularization_weight
+        self.pool_filter_size = pool_filter_size
+
+        # training parameters
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+
+        # ===== Create None variables for object =====
+        # variables [None]
+        self.embedding_lookup = None
+        self.emb = None  # raw features
+
+        # placeholders
+        self.X_ind, self.X_val, self.label = None, None, None
+        self.is_training = None
+
+        # ports to the outside
+        self.sigmoid_logits = None
+        self.regularization_loss = None
+        self.logloss, self.mean_logloss = None, None
+        self.overall_loss = None
+
+        # train/summary operations
+        self.train_op, self.merged = None, None
+
+        # intermediate results
+        self.feature_weights = None
+        self.sigmoid_logits = None
+
+        # global training steps
+        self.global_step = tf.Variable(0, name="global_step", trainable=False)
+
+        # operations
+        self.optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate,
+                                                beta1=0.9,
+                                                beta2=0.98,
+                                                epsilon=1e-8)
+
+        self.build_graph()
+
+    def build_graph(self):
+        # Define input
+        with tf.name_scope("input_ph"):
+            # 普通占位符：batchsize*特征数
+            self.X_ind = tf.placeholder(dtype=tf.int32,
+                                        shape=[None, self.field_size],
+                                        name="X_index")
+            self.label = tf.placeholder(dtype=tf.float32,
+                                        shape=[None],
+                                        name="label")
+            self.is_training = tf.placeholder(dtype=tf.bool,
+                                              shape=(),
+                                              name="is_training")
+
+        # lookup and process embedding。就是随机向量一下
+        with tf.name_scope("embedding"):
+            self.emb = embedding(inputs=self.X_ind,
+                                 last_pad=True,
+                                 vocab_size=self.feat_size,
+                                 num_units=self.embedding_dim,
+                                 scale=self.scale_embedding,
+                                 scope="embedding_process")
+
+        # self.emb: raw embedding, features: used for later
+        # 这tm就是个map,feat_size个code对应的向量，维度为embedding_dim
+        # batchsize*feat_size*embedding_size
+        # (?,1638,12)
+        features = self.emb
+        features_split_1, features_split_2, features_split_3 = \
+            tf.split(value=features, num_or_size_splits=3, axis=1)
+
+        #TODO 改动就是删去了multi_attention
+        # multi-head feature to agg 1st order feature
+        with tf.name_scope("Agg_first_order") as scope:
+            ctx_order_1 = tf.get_variable(
+                name="context_order_1",
+                shape=(self.attention_size),
+                dtype=tf.float32)
+
+            agg_feat_1, self.attn_1 = agg_attention(
+                query=ctx_order_1,
+                keys=features_split_1,
+                values=features_split_1,
+                attention_size=self.attention_size,
+                regularize_scale=self.regularization_weight
+            )  # [N, dim]
+        with tf.name_scope("Agg_second_order") as scope:
+            ctx_order_2 = tf.get_variable(
+                name="context_order_2",
+                shape=(self.attention_size),
+                dtype=tf.float32)
+            agg_feat_2, self.attn_2 = agg_attention(
+                query=ctx_order_2,
+                keys=features_split_2,
+                values=features_split_2,
+                attention_size=self.attention_size,
+                regularize_scale=self.regularization_weight
+            )  # [N, dim]
+        with tf.name_scope("Agg_third_order") as scope:
+            ctx_order_3 = tf.get_variable(
+                name="context_order_3",
+                shape=(self.attention_size),
+                dtype=tf.float32)
+            agg_feat_3, self.attn_3 = agg_attention(
+                query=ctx_order_3,
+                keys=features_split_3,
+                values=features_split_3,
+                attention_size=self.attention_size,
+                regularize_scale=self.regularization_weight
+            )  # [N, dim]
+            #此处搞个attn_k跟attn_3一样，无意义操作,只是对比时懒得改main.py
+            self.attn_k=self.attn_3
+
+        print("look something")
+        # 此处可以添加上LSTM试试1
+        cell1 = tf.contrib.rnn.BasicLSTMCell(num_units=50, state_is_tuple=False)
+        test_output1, test_laststate1 = tf.nn.dynamic_rnn(cell=cell1, inputs=tf.stack([agg_feat_1], axis=1),
+                                                          dtype=tf.float32)
+        agg_feat_1 = test_laststate1
+        # 2
+        # cell2 = tf.contrib.rnn.BasicLSTMCell(num_units=50, state_is_tuple=False)
+        test_output2, test_laststate2 = tf.nn.dynamic_rnn(cell=cell1, inputs=tf.stack([agg_feat_2], axis=1),
+                                                          dtype=tf.float32)
+        agg_feat_2 = test_laststate2
+        # 3
+        # cell3 = tf.contrib.rnn.BasicLSTMCell(num_units=50, state_is_tuple=False)
+        test_output3, test_laststate3 = tf.nn.dynamic_rnn(cell=cell1, inputs=tf.stack([agg_feat_3], axis=1),
+                                                          dtype=tf.float32)
+        agg_feat_3 = test_laststate3
+
+        with tf.name_scope("Merged_features"):
+            # concatenate [enc, second_cross, third_cross]
+            # TODO: can + multihead_features
+            # (?,3,12)
+            all_features = tf.stack([
+                agg_feat_1,
+                agg_feat_2,
+                agg_feat_3,
+            ],
+                axis=1, name="concat_feature")  # (N, k, C)
+        # map C to pool_filter_size dimension
+        # kernel_size=1,所以有batchsize*3，然后pool_filter_size个过滤器==> (batchsize,3,pf_size)
+        mapped_all_feature = tf.layers.conv1d(
+            inputs=all_features,
+            filters=self.pool_filter_size,
+            kernel_size=1,
+            use_bias=True,
+            name="Mapped_all_feature"
+        )  # (N, k, pf_size)
+
+        # apply context vector
+        # tf.squeeze:删掉指定维度为1的：
+        # 全连接将mapped_all_feature结构==》 （batchsize,3,1）
+        # squeeze将==> (batchsize,3)
+        # softmax==>(batchSize,3)
+
+        feature_weights = tf.nn.softmax(
+            tf.squeeze(
+                tf.layers.dense(
+                    mapped_all_feature,
+                    units=1,
+                    activation=None,
+                    use_bias=False
+                ),  # (N, k, 1),
+                [2]
+            ),  # (N, k)
+        )  # (N, k)
+        # self.attn_k = feature_weights
+
+        # weighted sum
+        # all_features = [?,3,12]
+        # feature_weights= [?,3]
+        # multify ==> [?,3,12]
+        # reduce_sum ==> [?,12] ==>以1为维度的reduce_sum
+        weighted_sum_feat = tf.reduce_sum(
+            tf.multiply(
+                all_features,
+                tf.expand_dims(feature_weights, axis=2),
+            ),  # (N, k, C)
+            axis=[1],
+            name="Attn_weighted_sum_feature"
+        )  # (N, C)
+
+        # last non-linear
+        hidden_logits = tf.layers.dense(
+            weighted_sum_feat,
+            units=self.embedding_dim // 2,
+            activation=tf.nn.relu,
+            use_bias=False,
+            name="HiddenLogits"
+        )  # (N, C/2)
+
+        # the last dense for logits
+        logits = tf.squeeze(
+            tf.layers.dense(
+                hidden_logits,
+                units=1,
+                activation=None,
+                use_bias=False,
+                name="Logits"
+            ),  # (N, 1)
+            axis=[1]
+        )  # (N,)
+
+        # 后面都是计算loss了，没啥说的。。
+        # sigmoid logits
+        self.sigmoid_logits = tf.nn.sigmoid(logits)
+
+        # regularization term
+        self.regularization_loss = tf.losses.get_regularization_loss()
+
+        self.logloss = tf.reduce_sum(
+            tf.nn.sigmoid_cross_entropy_with_logits(
+                labels=tf.expand_dims(self.label, -1),
+                logits=tf.expand_dims(logits, -1),
+                name="SumLogLoss"))
+
+        self.mean_logloss = tf.divide(
+            self.logloss,
+            tf.to_float(self.batch_size),
+            name="MeanLogLoss"
+        )
+
+        # overall loss
+        self.overall_loss = tf.add(
+            self.mean_logloss,
+            self.regularization_loss,
+            name="OverallLoss"
+        )
+
+        tf.summary.scalar("Mean_LogLoss", self.mean_logloss)
+        tf.summary.scalar("Reg_Loss", self.regularization_loss)
+        tf.summary.scalar("Overall_Loss", self.overall_loss)
+
+        self.train_op = self.optimizer.minimize(self.overall_loss,
+                                                global_step=self.global_step)
+        self.merged = tf.summary.merge_all()
